@@ -289,9 +289,9 @@ def load_results(filename: str) -> List[ResultInfo]:
 def loadProblems(path):
     return [ProjectSchedulingModel.from_file(f"{path}{i}_{j}.sm") for i in range(1, 49) for j in range(1, 11)] 
 
-def loadBestKnown(dataset):
+def loadBestKnown(dataset, path=""):
     if dataset == 30:
-        with open("j30opt.sm", "r") as f:
+        with open(f"{path}j30opt.sm", "r") as f:
             lines = f.readlines()
 
         optimal = []
@@ -301,7 +301,7 @@ def loadBestKnown(dataset):
         
         return optimal    
 
-    with open(f"j{dataset}hrs.sm") as f:
+    with open(f"{path}j{dataset}hrs.sm") as f:
         lines = f.readlines()
         
     optimal = []

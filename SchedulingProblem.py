@@ -38,7 +38,7 @@ class Resources:
         self.resourcesList = resourcesList
         self.resources = np.array([resource.capacity for resource in resourcesList])
         
-    def get_time_for_resources(self, jobs: List[Job], job: Job, base_time: int, end_time=np.Infinity) -> int:
+    def get_time_for_resources(self, jobs: List[Job], job: Job, base_time: int, end_time=np.inf) -> int:
         resources = self.resources
         for start_time in count(base_time):
             if start_time >= end_time:
