@@ -82,7 +82,7 @@ class ABC:
                 size=p.population_size,
                 p=self.STEP_WEIGHTS,
             )
-            for i, (current, steps) in enumerate(zip(food_sources, step_choices)):
+            for i, current, steps in enumerate(zip(food_sources, step_choices)):
                 new_solution = multi_step_perturbation(current, steps=steps)
                 if new_solution.get_makespan() < current.get_makespan():
                     food_sources[i] = new_solution
@@ -100,7 +100,7 @@ class ABC:
             ]
             for selected in selected_indices:
                 updates[selected] += 1
-                new_solution = multi_step_perturbation(food_sources[selected], steps=1)
+                new_solution = multi_step_perturbation(food_sources[selected])
                 if new_solution.get_makespan() < food_sources[selected].get_makespan():
                     food_sources[selected] = new_solution
                     updates[selected] = 0

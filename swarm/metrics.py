@@ -21,7 +21,7 @@ def positional_entropy(permutations):
         total_entropy += entropy
 
     average_entropy = total_entropy / n
-    normalized_entropy = average_entropy / max_entropy if max_entropy > 0 else 0.0
+    normalized_entropy = average_entropy / max_entropy if max_entropy > 0 else 0
     return average_entropy, normalized_entropy
 
 
