@@ -1,6 +1,7 @@
 from swarm.problem import ProjectSchedulingModel, Job, Resource, Resources
 from swarm.solution import Schedule
-from swarm.abc import ABC, Parameters, OptimizationResult
+from swarm.abc import ABC, GSABC, ABCProblem, GSABCProblem, SupportsInitialPopulation, SupportsLocalSearch
+from swarm.rcpsp import RCPSPOperators
 from swarm.io import load_dataset, load_problems, load_best_known, save_results, load_results
 from swarm.heuristics import topological_sort
 from swarm.metrics import positional_entropy, arpd
@@ -12,8 +13,10 @@ __all__ = [
     "ProjectSchedulingModel", "Job", "Resource", "Resources",
     # Solution
     "Schedule",
-    # Algorithm
-    "ABC", "Parameters", "OptimizationResult",
+    # Algorithm (problem-agnostic, ask/tell)
+    "ABC", "GSABC", "ABCProblem", "GSABCProblem", "SupportsInitialPopulation", "SupportsLocalSearch",
+    # RCPSP adapter
+    "RCPSPOperators",
     # I/O
     "load_dataset", "load_problems", "load_best_known", "save_results", "load_results",
     # Heuristics
