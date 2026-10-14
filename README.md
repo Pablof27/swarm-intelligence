@@ -31,8 +31,10 @@ python -m swarm Problems/j30.sm/j301_1.sm
 ```bash
 git clone https://github.com/Pablof27/swarm-intelligence.git
 cd swarm-intelligence
-pip install numpy matplotlib dijkstar rich   # rich is only needed by the command-line interface
+pip install -r requirements.txt
 ```
+
+Requires Python 3.10 or newer. `rich` is only needed by the command-line interface and `dijkstar` only by `Schedule.critical_path()`.
 
 ## Benchmarks
 
@@ -75,6 +77,8 @@ python -m swarm Problems/j30.sm -a gs-abc -i mcmc --stagnation 5 -w 8 -s 42 -q -
 | `-o`, `--output FILE`                  |                               | Save the results as JSON, readable with `load_results`                      |
 | `--log-every N`                        | 0                             | Also log every N-th generation                                              |
 | `-q`, `--quiet`                        |                               | Only log finished runs                                                      |
+| `-c`, `--checkpoint DIR`               |                               | Save the progress in `DIR` and resume from it (see [Checkpoints](#checkpoints)) |
+| `--checkpoint-interval SECONDS`        | 30                            | Seconds between snapshots of the running instances                          |
 
 While it runs, the terminal shows:
 
@@ -83,6 +87,20 @@ While it runs, the terminal shows:
 - above them, a log of past generations (every improvement of the best makespan, plus every N-th generation with `--log-every`), one line per finished run and a summary at the end.
 
 Each instance runs with its own seed, derived from `--seed` and the instance name (the file name without `.sm`), so instances use independent random streams while results stay reproducible: an instance gives the same result whatever the number of workers or the other instances in the batch, and different algorithm configurations see the same random stream on the same instance. To reproduce a run from Python, pass `seed=instance_seed(seed, name)` (from `swarm.cli`) to `ABC` or `GSABC`. Press Ctrl+C to stop early: the finished runs are still summarized and saved.
+
+### Checkpoints
+
+Long batches can be stopped and resumed with `--checkpoint DIR`: running the same command again continues where it left off.
+
+```bash
+python -m swarm Problems/j120.sm -a gs-abc -w 8 -s 42 -q -c Results/j120.ckpt -o Results/j120.json
+```
+
+- Finished runs are stored as soon as they end and are not run again.
+- Running instances are snapshotted between generations every `--checkpoint-interval` seconds, so a crash loses at most that much work per instance. On Ctrl+C they are saved before the program exits (press Ctrl+C twice to quit immediately).
+- A resumed run continues from its snapshot and gives exactly the same result as an uninterrupted one, whatever the number of workers.
+
+The checkpoint stores the options that determine the results and refuses to resume with different ones; `--seed` can be omitted when resuming. Instances can be added to the command line between sessions. Snapshots are pickle files, so only resume checkpoints you created.
 
 ## Usage
 
@@ -273,6 +291,7 @@ swarm/
 ├── abc.py           # Problem-agnostic ABC / GS-ABC optimizers (ask/tell) and problem protocols
 ├── rcpsp.py         # RCPSPOperators: RCPSP operators, heuristic initialization and local search
 ├── cli.py           # Command-line interface with live progress
+├── checkpoint.py    # Checkpoints to stop and resume command-line batches
 ├── metrics.py       # Entropy, distances, ARPD
 ├── io.py            # Dataset loading and result serialization
 └── plotting.py      # Gantt-style schedule visualization

@@ -1,0 +1,4 @@
+numpy>=1.21
+matplotlib>=3.5
+dijkstar>=2.6   # Schedule.critical_path()
+rich>=12.0      # command-line interface (python -m swarm)

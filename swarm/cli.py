@@ -20,10 +20,10 @@ import statistics
 import time
 import traceback
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from rich import box
@@ -36,6 +36,7 @@ from rich.table import Table
 from rich.text import Text
 
 from swarm.abc import ABC, GSABC
+from swarm.checkpoint import Checkpoint, CheckpointMismatch, load_snapshot, save_snapshot
 from swarm.io import ResultInfo, SolutionInfo, save_results
 from swarm.metrics import calculate_unique_individuals, jobs2times, positional_entropy
 from swarm.problem import ProjectSchedulingModel
@@ -46,6 +47,22 @@ REFERENCE_FILE = re.compile(r"^j\d+(opt|hrs|lb)$")
 REPORT_INTERVAL = 0.25  # seconds between progress messages sent by a worker
 REFRESH_INTERVAL = 0.125  # seconds between dashboard redraws
 THROUGHPUT_WINDOW = 30.0  # seconds of history used to estimate evaluations per second
+PAUSE_TIMEOUT = 60.0  # seconds to wait for running instances to save their progress after Ctrl+C
+RESULT_SETTINGS = (  # options that determine the results, stored in checkpoints
+    "algorithm",
+    "init",
+    "heuristics_rate",
+    "sampling_rate",
+    "population_size",
+    "limit",
+    "stagnation",
+    "mutation_rate",
+    "local_search_interval",
+    "batch_onlookers",
+    "max_evaluations",
+    "stop_at_best_known",
+    "seed",
+)
 
 
 @dataclass(frozen=True)
@@ -65,6 +82,7 @@ class RunConfig:
     seed: int
     log_every: int
     log_improvements: bool
+    checkpoint_interval: float
 
 
 @dataclass(frozen=True)
@@ -73,6 +91,7 @@ class RunTask:
     path: str
     best_known: int
     seed: int
+    snapshot: str | None = None  # where the run saves its progress, None without checkpoint
 
     @property
     def name(self) -> str:
@@ -165,6 +184,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--log-every", type=int, default=0, metavar="N", help="also log every N-th generation (default: only improvements)"
     )
     output.add_argument("-q", "--quiet", action="store_true", help="only log finished runs")
+
+    checkpoint = parser.add_argument_group("checkpoint")
+    checkpoint.add_argument(
+        "-c",
+        "--checkpoint",
+        type=Path,
+        metavar="DIR",
+        help="save the progress in DIR; running the same command again resumes from it",
+    )
+    checkpoint.add_argument(
+        "--checkpoint-interval",
+        type=float,
+        metavar="SECONDS",
+        help="seconds between snapshots of the running instances (default: 30)",
+    )
     return parser
 
 
@@ -185,6 +219,8 @@ def parse_config(parser: argparse.ArgumentParser, args: argparse.Namespace) -> t
         (args.seed is not None and not 0 <= args.seed < 2**32, "--seed must be between 0 and 2**32 - 1"),
         (args.log_every < 0, "--log-every must be >= 0"),
         (args.quiet and args.log_every > 0, "--quiet and --log-every cannot be combined"),
+        (args.checkpoint_interval is not None and args.checkpoint is None, "--checkpoint-interval requires --checkpoint"),
+        (args.checkpoint_interval is not None and args.checkpoint_interval <= 0, "--checkpoint-interval must be > 0"),
     ]
     for failed, message in errors:
         if failed:
@@ -212,6 +248,7 @@ def parse_config(parser: argparse.ArgumentParser, args: argparse.Namespace) -> t
         seed=random.SystemRandom().randrange(2**32) if args.seed is None else args.seed,
         log_every=args.log_every,
         log_improvements=not args.quiet,
+        checkpoint_interval=30.0 if args.checkpoint_interval is None else args.checkpoint_interval,
     )
     return config, args.workers or os.cpu_count() or 1
 
@@ -265,25 +302,40 @@ def _reference_table(path: Path) -> dict[tuple[int, int], int]:
 
 # ------------------------------------------------------------------------------- workers
 _updates: Any = None
+_stop: Any = None
 
 
-def _init_worker(updates: Any) -> None:
-    global _updates
+def _init_worker(updates: Any, stop: Any) -> None:
+    global _updates, _stop
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl+C is handled by the main process
-    _updates = updates
+    _updates, _stop = updates, stop
 
 
 def _solve(task: RunTask, config: RunConfig) -> None:
+    if _stop.is_set():
+        return  # the batch is pausing: queued instances are left for the next session
     try:
-        _updates.put(("done", task.index, _run(task, config)))
+        kind, payload = _run(task, config)
+        _updates.put((kind, task.index, payload))
     except Exception:
         _updates.put(("error", task.index, traceback.format_exc()))
 
 
-def _run(task: RunTask, config: RunConfig) -> dict:
-    started = time.perf_counter()
-    _updates.put(("start", task.index, None))
+@dataclass
+class RunProgress:
+    """Everything an unfinished run needs to continue; pickled into checkpoint snapshots."""
 
+    problem_id: str
+    optimizer: ABC
+    best_history: list[int] = field(default_factory=list)
+    diversity: list[float] = field(default_factory=list)
+    unique: list[int] = field(default_factory=list)
+    scouts: list[int] = field(default_factory=list)
+    last_improvement: int = 0
+    elapsed: float = 0.0
+
+
+def _new_run(task: RunTask, config: RunConfig) -> RunProgress:
     model = ProjectSchedulingModel.from_file(task.path)
     model.best_known = task.best_known
     operators = RCPSPOperators(model, heuristics_rate=config.heuristics_rate, sampling_rate=config.sampling_rate)
@@ -296,26 +348,44 @@ def _run(task: RunTask, config: RunConfig) -> dict:
         seed=task.seed,
     )
     if config.algorithm == "gs-abc":
-        optimizer = GSABC(operators, mutation_rate=config.mutation_rate, **options)
-    else:
-        optimizer = ABC(operators, **options)
+        return RunProgress(model.name, GSABC(operators, mutation_rate=config.mutation_rate, **options))
+    return RunProgress(model.name, ABC(operators, **options))
+
+
+def _resumed_run(task: RunTask) -> RunProgress | None:
+    snapshot = load_snapshot(task.snapshot) if task.snapshot else None
+    if snapshot is None or (snapshot["seed"], snapshot["best_known"]) != (task.seed, task.best_known):
+        return None
+    random.setstate(snapshot["random"])
+    np.random.set_state(snapshot["numpy"])
+    return snapshot["progress"]
+
+
+def _run(task: RunTask, config: RunConfig) -> tuple[str, dict]:
+    started = time.perf_counter()
+    progress = _resumed_run(task)
+    resumed = progress is not None
+    if progress is None:
+        progress = _new_run(task, config)
+    optimizer = progress.optimizer
+    resumed_at = {"generation": optimizer.cycle, "evaluations": optimizer.n_evaluations} if resumed else None
+    _updates.put(("start", task.index, resumed_at))
     target = task.best_known if config.stop_at_best_known and task.best_known > 0 else -math.inf
 
-    best_history: list[int] = []
-    diversity: list[float] = []
-    unique: list[int] = []
-    scouts: list[int] = []
-    last_improvement = 0
+    def elapsed() -> float:
+        return progress.elapsed + time.perf_counter() - started
 
     def step() -> None:
         schedules = optimizer.ask()
         optimizer.tell([s.get_makespan() for s in schedules])
 
     def record(released: int) -> None:
-        best_history.append(int(optimizer.best_fitness))
-        diversity.append(float(positional_entropy([[job.id for job in s.jobs] for s in optimizer.population])[1]))
-        unique.append(calculate_unique_individuals(optimizer.population))
-        scouts.append(released)
+        progress.best_history.append(int(optimizer.best_fitness))
+        progress.diversity.append(
+            float(positional_entropy([[job.id for job in s.jobs] for s in optimizer.population])[1])
+        )
+        progress.unique.append(calculate_unique_individuals(optimizer.population))
+        progress.scouts.append(released)
 
     def send(log: bool, improved: bool) -> None:
         stats = dict(
@@ -323,28 +393,51 @@ def _run(task: RunTask, config: RunConfig) -> dict:
             evaluations=optimizer.n_evaluations,
             best=int(optimizer.best_fitness),
             mean=float(np.mean(optimizer.fitness)),
-            diversity=diversity[-1],
-            scouts=sum(scouts),
-            last_improvement=last_improvement,
-            elapsed=time.perf_counter() - started,
+            diversity=progress.diversity[-1],
+            scouts=sum(progress.scouts),
+            last_improvement=progress.last_improvement,
+            elapsed=elapsed(),
             log=log,
             improved=improved,
         )
         _updates.put(("progress", task.index, stats))
 
-    step()
-    record(0)
-    send(log=config.log_improvements, improved=False)
-    generation, rounds, last_report = 0, 0, time.perf_counter()
+    def save() -> None:
+        nonlocal started
+        now = time.perf_counter()
+        progress.elapsed += now - started
+        started = now
+        state = dict(
+            seed=task.seed,
+            best_known=task.best_known,
+            progress=progress,
+            random=random.getstate(),
+            numpy=np.random.get_state(),
+        )
+        save_snapshot(task.snapshot, state)
+
+    if not resumed:
+        step()
+        record(0)
+    send(log=config.log_improvements and not resumed, improved=False)
+    generation, rounds = optimizer.cycle, 0
+    last_report = last_save = time.perf_counter()
     while optimizer.n_evaluations < config.max_evaluations and optimizer.best_fitness > target:
+        if task.snapshot and rounds == 0:  # snapshots are taken between generations
+            pausing = _stop.is_set()
+            if pausing or time.perf_counter() - last_save >= config.checkpoint_interval:
+                save()
+                last_save = time.perf_counter()
+                if pausing:
+                    return "paused", {"generation": optimizer.cycle, "evaluations": optimizer.n_evaluations}
         step()
         rounds += 1
         if optimizer.cycle == generation:
             continue
         generation, rounds = optimizer.cycle, 0
-        improved = optimizer.best_fitness < best_history[-1]
+        improved = optimizer.best_fitness < progress.best_history[-1]
         if improved:
-            last_improvement = generation
+            progress.last_improvement = generation
         record(optimizer.n_scouts)
         log = (improved and config.log_improvements) or (config.log_every > 0 and generation % config.log_every == 0)
         now = time.perf_counter()
@@ -355,19 +448,19 @@ def _run(task: RunTask, config: RunConfig) -> dict:
         record(0)  # the run stopped in the middle of a generation
 
     best = optimizer.best
-    return dict(
+    return "done", dict(
         best=int(optimizer.best_fitness),
         generations=optimizer.cycle,
         evaluations=optimizer.n_evaluations,
-        elapsed=time.perf_counter() - started,
+        elapsed=elapsed(),
         reason="best known reached" if optimizer.best_fitness <= target else "budget exhausted",
         result=ResultInfo(
-            problem_id=model.name,
+            problem_id=progress.problem_id,
             best=SolutionInfo(makespan=int(optimizer.best_fitness), start_times=jobs2times(best.jobs)),
-            best_history=best_history,
-            population_diversity=diversity,
-            unique_solutions=unique,
-            scout_bees=scouts,
+            best_history=progress.best_history,
+            population_diversity=progress.diversity,
+            unique_solutions=progress.unique,
+            scout_bees=progress.scouts,
         ),
     )
 
@@ -391,15 +484,33 @@ class RunState:
 class Dashboard:
     """Main-process view of all runs, rendered live by ``rich``."""
 
-    def __init__(self, config: RunConfig, tasks: list[RunTask], workers: int):
+    def __init__(
+        self,
+        config: RunConfig,
+        tasks: list[RunTask],
+        workers: int,
+        restored: dict[int, dict] | None = None,
+        checkpoint: Path | None = None,
+        resumable: int = 0,
+    ):
         self.config = config
         self.tasks = tasks
         self.workers = workers
+        self.checkpoint = checkpoint
+        self.resumable = resumable
         self.active: dict[int, RunState] = {}
         self.finished: dict[int, dict] = {}
         self.failed: dict[int, str] = {}
+        self.paused: dict[int, dict] = {}
         self.closed_evaluations = 0
         self.unused_budget = 0
+        self.restored_evaluations = 0  # done in earlier sessions, excluded from the throughput
+        self.restored_runs = len(restored or {})
+        for index, outcome in (restored or {}).items():
+            self.finished[index] = outcome
+            self.closed_evaluations += outcome["evaluations"]
+            self.unused_budget += config.max_evaluations - outcome["evaluations"]
+            self.restored_evaluations += outcome["evaluations"]
         self.started = time.monotonic()
         self._samples: deque[tuple[float, int]] = deque()
         self._spinner = Spinner("dots", style="cyan")
@@ -415,8 +526,12 @@ class Dashboard:
         """Apply a worker message and return the lines to log above the live view."""
         task = self.tasks[index]
         if kind == "start":
-            self.active[index] = RunState(task.name, task.best_known)
-            return []
+            run = self.active[index] = RunState(task.name, task.best_known)
+            if payload is None:
+                return []
+            run.generation, run.evaluations = payload["generation"], payload["evaluations"]
+            self.restored_evaluations += payload["evaluations"]
+            return [_resumed_line(task, payload)]
         if kind == "progress":
             run = self.active[index]
             for key in ("generation", "evaluations", "best", "mean", "diversity", "scouts", "last_improvement", "elapsed"):
@@ -425,6 +540,10 @@ class Dashboard:
             return [_generation_line(run, payload["improved"])] if payload["log"] else []
 
         run = self.active.pop(index, None)
+        if kind == "paused":
+            self.paused[index] = payload
+            self.closed_evaluations += payload["evaluations"]
+            return [_paused_line(task, payload)]
         used = payload["evaluations"] if kind == "done" else run.evaluations if run else 0
         self.closed_evaluations += used
         self.unused_budget += self.config.max_evaluations - used
@@ -450,6 +569,9 @@ class Dashboard:
             + (" · batch onlookers" if c.batch_onlookers else ""),
             f"initialization: {initialization}",
         ]
+        if self.checkpoint:
+            earlier = f"{self.restored_runs} finished earlier · {self.resumable} to resume"
+            lines.append(f"checkpoint {self.checkpoint} ({earlier if self.restored_runs or self.resumable else 'new'})")
         title = f"RCPSP · {'GS-ABC' if c.algorithm == 'gs-abc' else 'ABC'}"
         return Panel("\n".join(lines), title=title, title_align="left", border_style="cyan", expand=False)
 
@@ -459,8 +581,12 @@ class Dashboard:
             gap for i, outcome in outcomes.items() if (gap := _gap(outcome["best"], self.tasks[i].best_known)) is not None
         ]
         runs = f"{len(outcomes)}/{len(self.tasks)} finished"
+        if self.restored_runs:
+            runs += f" ({self.restored_runs} in earlier sessions)"
         if self.failed:
             runs += f" · {len(self.failed)} failed"
+        if self.paused:
+            runs += f" · {len(self.paused)} saved to resume"
         if interrupted and self.active:
             runs += f" · {len(self.active)} interrupted"
         lines = [f"runs               {runs}"]
@@ -474,6 +600,8 @@ class Dashboard:
         lines.append(f"wall time          {_duration(time.monotonic() - self.started)}")
         if output:
             lines.append(f"results            {output}")
+        if self.checkpoint and not self.done:
+            lines.append(f"checkpoint         {self.checkpoint} (run the same command to resume)")
         failed = interrupted or bool(self.failed)
         return Panel(
             "\n".join(lines),
@@ -518,11 +646,11 @@ class Dashboard:
 
     def _overall(self) -> RenderableType:
         now, done = time.monotonic(), self.evaluations()
-        self._samples.append((now, done))
+        self._samples.append((now, done - self.restored_evaluations))
         while now - self._samples[0][0] > THROUGHPUT_WINDOW:
             self._samples.popleft()
         first_time, first_done = self._samples[0]
-        rate = (done - first_done) / (now - first_time) if now - first_time >= 1 else None
+        rate = (self._samples[-1][1] - first_done) / (now - first_time) if now - first_time >= 1 else None
         total = max(len(self.tasks) * self.config.max_evaluations - self.unused_budget, 1)
         eta = (total - done) / rate if rate else None
         closed = len(self.finished) + len(self.failed)
@@ -600,23 +728,81 @@ def _failed_line(task: RunTask, error: str) -> Text:
     return line
 
 
+def _resumed_line(task: RunTask, resumed_at: dict) -> Text:
+    line = _line_start(task.name)
+    line.append(" ↻ resumed", style="bold cyan")
+    line.append(f"  from the checkpoint at generation {resumed_at['generation']:,} · {resumed_at['evaluations']:,} evals")
+    return line
+
+
+def _paused_line(task: RunTask, paused_at: dict) -> Text:
+    line = _line_start(task.name)
+    line.append(" ⏸ saved", style="bold yellow")
+    line.append(f"  to the checkpoint at generation {paused_at['generation']:,} · {paused_at['evaluations']:,} evals")
+    return line
+
+
 # ---------------------------------------------------------------------------------- main
-def _monitor(dashboard: Dashboard, updates: Any, console: Console) -> None:
+def _monitor(
+    dashboard: Dashboard,
+    updates: Any,
+    console: Console,
+    until: Callable[[], bool],
+    on_message: Callable[[str, int, Any], None],
+    timeout: float = math.inf,
+) -> None:
+    deadline = time.monotonic() + timeout
     with Live(dashboard, console=console, auto_refresh=False, transient=True) as live:
         next_refresh = 0.0
-        while not dashboard.done:
-            lines: list[Text] = []
+        while not until() and time.monotonic() < deadline:
+            messages = []
             try:
-                lines += dashboard.handle(*updates.get(timeout=REFRESH_INTERVAL))
-                while len(lines) < 200:
-                    lines += dashboard.handle(*updates.get_nowait())
+                messages.append(updates.get(timeout=REFRESH_INTERVAL))
+                while len(messages) < 200:
+                    messages.append(updates.get_nowait())
             except queue.Empty:
                 pass
+            lines: list[Text] = []
+            for message in messages:
+                on_message(*message)
+                lines += dashboard.handle(*message)
             if lines:
                 live.console.print(Group(*lines))
             if time.monotonic() >= next_refresh:
                 live.refresh()
                 next_refresh = time.monotonic() + REFRESH_INTERVAL
+
+
+def _run_batch(
+    tasks: list[RunTask], config: RunConfig, workers: int, dashboard: Dashboard, console: Console, checkpoint: Checkpoint | None
+) -> bool:
+    """Run ``tasks`` in a process pool; returns True when interrupted with Ctrl+C."""
+
+    def on_message(kind: str, index: int, payload: Any) -> None:
+        if kind == "done" and checkpoint is not None:
+            checkpoint.record(dashboard.tasks[index].name, payload)
+
+    context = mp.get_context("spawn")
+    updates, stop = context.Queue(), context.Event()
+    pool = context.Pool(workers, initializer=_init_worker, initargs=(updates, stop))
+    try:
+        for task in tasks:
+            pool.apply_async(_solve, (task, config))
+        pool.close()
+        _monitor(dashboard, updates, console, lambda: dashboard.done, on_message)
+        pool.join()
+        return False
+    except KeyboardInterrupt:
+        if checkpoint is not None and dashboard.active:
+            stop.set()
+            console.print("Saving the running instances to the checkpoint… (Ctrl+C again to quit now)", style="yellow")
+            try:
+                _monitor(dashboard, updates, console, lambda: not dashboard.active, on_message, PAUSE_TIMEOUT)
+            except KeyboardInterrupt:
+                pass
+        pool.terminate()
+        pool.join()
+        return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -630,31 +816,38 @@ def main(argv: list[str] | None = None) -> int:
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
 
+    checkpoint = None
+    finished_before: dict[str, dict] = {}
+    if args.checkpoint:
+        try:
+            stored = Checkpoint.stored_settings(args.checkpoint)
+            if stored is not None and args.seed is None:
+                config = replace(config, seed=stored["seed"])  # resuming without --seed keeps the original seed
+            checkpoint = Checkpoint.open(args.checkpoint, {name: getattr(config, name) for name in RESULT_SETTINGS})
+        except CheckpointMismatch as error:
+            parser.error(str(error))
+        finished_before = checkpoint.finished_runs()
+
     search_dirs = [args.best_known_dir] if args.best_known_dir else []
     tasks = [
-        RunTask(i, str(path), best_known_makespan(path, search_dirs), instance_seed(config.seed, path.stem))
+        RunTask(
+            i,
+            str(path),
+            best_known_makespan(path, search_dirs),
+            instance_seed(config.seed, path.stem),
+            str(checkpoint.snapshot_path(path.stem)) if checkpoint else None,
+        )
         for i, path in enumerate(files)
     ]
-    workers = min(workers, len(tasks))
+    restored = {task.index: finished_before[task.name] for task in tasks if task.name in finished_before}
+    pending = [task for task in tasks if task.index not in restored]
+    resumable = sum(1 for task in pending if task.snapshot and Path(task.snapshot).exists())
+    workers = max(1, min(workers, len(pending)))
 
     console = Console()
-    dashboard = Dashboard(config, tasks, workers)
+    dashboard = Dashboard(config, tasks, workers, restored, args.checkpoint, resumable)
     console.print(dashboard.header())
-
-    context = mp.get_context("spawn")
-    updates = context.Queue()
-    pool = context.Pool(workers, initializer=_init_worker, initargs=(updates,))
-    interrupted = False
-    try:
-        for task in tasks:
-            pool.apply_async(_solve, (task, config))
-        pool.close()
-        _monitor(dashboard, updates, console)
-        pool.join()
-    except KeyboardInterrupt:
-        interrupted = True
-        pool.terminate()
-        pool.join()
+    interrupted = _run_batch(pending, config, workers, dashboard, console, checkpoint) if pending else False
 
     results = [dashboard.finished[i]["result"] for i in sorted(dashboard.finished)]
     output = args.output if args.output and results else None
