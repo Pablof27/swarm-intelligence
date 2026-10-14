@@ -20,13 +20,21 @@ print(f"Makespan: {optimizer.best.get_makespan()}")
 optimizer.best.plot()
 ```
 
+Or from the terminal, with live progress (see [Command-Line Interface](#command-line-interface)):
+
+```bash
+python -m swarm Problems/j30.sm/j301_1.sm
+```
+
 ## Installation
 
 ```bash
 git clone https://github.com/Pablof27/swarm-intelligence.git
 cd swarm-intelligence
-pip install numpy matplotlib dijkstar
+pip install -r requirements.txt
 ```
+
+Requires Python 3.10 or newer. `rich` is only needed by the command-line interface and `dijkstar` only by `Schedule.critical_path()`.
 
 ## Benchmarks
 
@@ -40,6 +48,59 @@ The algorithm is evaluated on the standard [PSPLib](http://www.om-db.wi.tum.de/p
 | j120    | 120  | 480       |
 
 Place the benchmark files under `Problems/` following the existing directory structure. Best-known solutions are loaded automatically by `load_dataset()`.
+
+## Command-Line Interface
+
+Solve one or many instances from the terminal and follow the runs live:
+
+```bash
+# One instance, logging every 100th generation besides the improvements
+python -m swarm Problems/j30.sm/j301_1.sm --seed 42 --log-every 100
+
+# A whole dataset with GS-ABC, MCMC initialization and 8 parallel runs, logging only finished runs and saving the results
+python -m swarm Problems/j30.sm -a gs-abc -i mcmc --stagnation 5 -w 8 -s 42 -q -o Results/j30_gs-abc.json
+```
+
+`PATH` arguments can be problem files, directories of `.sm` files or glob patterns. Best-known makespans are read from the PSPLIB `j*opt.sm` / `j*hrs.sm` files next to the instances (or from `--best-known-dir`); they are used to report the gap and, by default, to stop a run as soon as it is reached.
+
+| Option                                 | Default                       | Description                                                                 |
+|----------------------------------------|-------------------------------|-----------------------------------------------------------------------------|
+| `-a`, `--algorithm {abc,gs-abc}`       | `abc`                         | Algorithm variant                                                           |
+| `-i`, `--init {random,heuristic,mcmc}` | `random`                      | Random activity orders, priority-rule orders (LDF, SDF, MRF, LRF) or MCMC samples around them |
+| `--heuristics-rate R`                  | 1.0                           | Share of the colony seeded from priority rules (`heuristic`, `mcmc`)       |
+| `--sampling-rate N`                    | 25                            | MCMC spacing between samples (`mcmc`)                                       |
+| `-p`, `--population-size`, `--limit`, `--stagnation`, `--mutation-rate`, `--local-search-interval`, `--batch-onlookers` | see [Parameters](#parameters) | Algorithm parameters |
+| `-e`, `--max-evaluations N`            | 50000                         | Evaluation budget per run                                                   |
+| `--no-stop-at-best-known`              |                               | Keep running after reaching the best-known makespan                         |
+| `-s`, `--seed N`                       | random                        | Base seed, shown in the header; every instance runs with its own seed derived from it |
+| `-w`, `--workers N`                    | 1                             | Runs in parallel (0 = one per CPU core)                                     |
+| `-o`, `--output FILE`                  |                               | Save the results as JSON, readable with `load_results`                      |
+| `--log-every N`                        | 0                             | Also log every N-th generation                                              |
+| `-q`, `--quiet`                        |                               | Only log finished runs                                                      |
+| `-c`, `--checkpoint DIR`               |                               | Save the progress in `DIR` and resume from it (see [Checkpoints](#checkpoints)) |
+| `--checkpoint-interval SECONDS`        | 30                            | Seconds between snapshots of the running instances                          |
+
+While it runs, the terminal shows:
+
+- a live table with the current generation of every running instance: evaluations used, best makespan, best known, gap, mean makespan and diversity of the population, scouts released, generations since the last improvement, elapsed time and ETA;
+- an overall progress bar with the finished runs, the throughput and the estimated time to finish the batch (an upper bound, since queued runs are assumed to use their whole budget);
+- above them, a log of past generations (every improvement of the best makespan, plus every N-th generation with `--log-every`), one line per finished run and a summary at the end.
+
+Each instance runs with its own seed, derived from `--seed` and the instance name (the file name without `.sm`), so instances use independent random streams while results stay reproducible: an instance gives the same result whatever the number of workers or the other instances in the batch, and different algorithm configurations see the same random stream on the same instance. To reproduce a run from Python, pass `seed=instance_seed(seed, name)` (from `swarm.cli`) to `ABC` or `GSABC`. Press Ctrl+C to stop early: the finished runs are still summarized and saved.
+
+### Checkpoints
+
+Long batches can be stopped and resumed with `--checkpoint DIR`: running the same command again continues where it left off.
+
+```bash
+python -m swarm Problems/j120.sm -a gs-abc -w 8 -s 42 -q -c Results/j120.ckpt -o Results/j120.json
+```
+
+- Finished runs are stored as soon as they end and are not run again.
+- Running instances are snapshotted between generations every `--checkpoint-interval` seconds, so a crash loses at most that much work per instance. On Ctrl+C they are saved before the program exits (press Ctrl+C twice to quit immediately).
+- A resumed run continues from its snapshot and gives exactly the same result as an uninterrupted one, whatever the number of workers.
+
+The checkpoint stores the options that determine the results and refuses to resume with different ones; `--seed` can be omitted when resuming. Instances can be added to the command line between sessions. Snapshots are pickle files, so only resume checkpoints you created.
 
 ## Usage
 
@@ -222,12 +283,15 @@ Adding `recombine` and `mutate` is enough to solve the same problem with `GSABC`
 ```
 swarm/
 ├── __init__.py      # Public API
+├── __main__.py      # Entry point for python -m swarm
 ├── problem.py       # Job, Resource, ProjectSchedulingModel
 ├── solution.py      # Schedule (feasible schedule representation)
 ├── operators.py     # random_reinsert, adjacent_swap, recombine, ...
 ├── heuristics.py    # Topological sort with priority rules (LDF, SDF, MRF, LRF)
 ├── abc.py           # Problem-agnostic ABC / GS-ABC optimizers (ask/tell) and problem protocols
 ├── rcpsp.py         # RCPSPOperators: RCPSP operators, heuristic initialization and local search
+├── cli.py           # Command-line interface with live progress
+├── checkpoint.py    # Checkpoints to stop and resume command-line batches
 ├── metrics.py       # Entropy, distances, ARPD
 ├── io.py            # Dataset loading and result serialization
 └── plotting.py      # Gantt-style schedule visualization
